@@ -36,7 +36,7 @@
 /*---------------------------------------------------*/
 void BZ2_bsInitWrite ( EState* s )
 {
-   s->bsLive = 0;
+   s->bsLive = sizeof(s->bsBuff) * 8;
    s->bsBuff = 0;
 }
 
@@ -45,57 +45,45 @@ void BZ2_bsInitWrite ( EState* s )
 static
 void bsFinishWrite ( EState* s )
 {
-   while (s->bsLive > 0) {
-      s->zbits[s->numZ] = (UChar)(s->bsBuff >> 24);
+   while (s->bsLive < sizeof(s->bsBuff) * 8) {
+      s->zbits[s->numZ] = (UChar)(s->bsBuff >> (sizeof(s->bsBuff) * 8 - 8));
       s->numZ++;
       s->bsBuff <<= 8;
-      s->bsLive -= 8;
+      s->bsLive += 8;
    }
 }
 
 
 /*---------------------------------------------------*/
-#define bsNEEDW(nz)                           \
-{                                             \
-   while (s->bsLive >= 8) {                   \
-      s->zbits[s->numZ]                       \
-         = (UChar)(s->bsBuff >> 24);          \
-      s->numZ++;                              \
-      s->bsBuff <<= 8;                        \
-      s->bsLive -= 8;                         \
-   }                                          \
+#define bsNEEDW(nz)                                           \
+{                                                             \
+   while (s->bsLive <= (sizeof(s->bsBuff) * 8 - 8)) {         \
+      s->zbits[s->numZ]                                       \
+         = (UChar)(s->bsBuff >> (sizeof(s->bsBuff) * 8 - 8)); \
+      s->numZ++;                                              \
+      s->bsBuff <<= 8;                                        \
+      s->bsLive += 8;                                         \
+   }                                                          \
 }
 
 
 /*---------------------------------------------------*/
 static
 __inline__
-void bsW ( EState* s, Int32 n, UInt32 v )
+void bsW ( EState* s, Int32 n, UInt v )
 {
    bsNEEDW ( n );
-   s->bsBuff |= (v << (32 - s->bsLive - n));
-   s->bsLive += n;
+   s->bsBuff |= (v << (s->bsLive -= n));
 }
 
 
 /*---------------------------------------------------*/
 static
-void bsPutUInt32 ( EState* s, UInt32 u )
+void bsPutUInt32 ( EState* s, UInt u )
 {
-   bsW ( s, 8, (u >> 24) & 0xffL );
-   bsW ( s, 8, (u >> 16) & 0xffL );
-   bsW ( s, 8, (u >>  8) & 0xffL );
-   bsW ( s, 8,  u        & 0xffL );
+   bsW ( s, 16, (u >> 16) );
+   bsW ( s, 16, (u & 0xffff) );
 }
-
-
-/*---------------------------------------------------*/
-static
-void bsPutUChar ( EState* s, UChar c )
-{
-   bsW( s, 8, (UInt32)c );
-}
-
 
 /*---------------------------------------------------*/
 /*--- The back end proper                         ---*/
@@ -103,34 +91,17 @@ void bsPutUChar ( EState* s, UChar c )
 
 /*---------------------------------------------------*/
 static
-void makeMaps_e ( EState* s )
-{
-   Int32 i;
-   s->nInUse = 0;
-   for (i = 0; i < 256; i++)
-      if (s->inUse[i]) {
-         s->unseqToSeq[i] = s->nInUse;
-         s->nInUse++;
-      }
-}
-
-
-/*---------------------------------------------------*/
-static
 void generateMTFValues ( EState* s )
 {
    UChar   yy[256];
-   Int32   i, j;
-   Int32   zPend;
-   Int32   wr;
-   Int32   EOB;
+   UChar*  mtfbase[255 / MTFL_SIZE + 1];
+   Int     zPend;
+   Int     i;
+   Int     EOB;
 
    /* 
       After sorting (eg, here),
-         s->arr1 [ 0 .. s->nblock-1 ] holds sorted order,
-         and
-         ((UChar*)s->arr2) [ 0 .. s->nblock-1 ] 
-         holds the original block data.
+         s->arr1 [ 0 .. s->nblock-1 ] holds BWT values,
 
       The first thing to do is generate the MTF values,
       and put them in
@@ -141,93 +112,120 @@ void generateMTFValues ( EState* s )
 
       The final compressed bitstream is generated into the
       area starting at
-         (UChar*) (&((UChar*)s->arr2)[s->nblock])
+         (UChar*) (&((UInt16*)s->arr1)[s->blockSize100k*100000])
 
-      These storage aliases are set up in bzCompressInit(),
-      except for the last one, which is arranged in 
-      compressBlock().
+      These storage aliases are set up in bzCompressInit().
    */
-   UInt32* ptr   = s->ptr;
-   UChar* block  = s->block;
-   UInt16* mtfv  = s->mtfv;
+   UInt32 *ptr;
+   UInt16 *mtfv;
+   UInt    yy0, ll_i, tmp, lno;
+   UChar  *pc, *pe;
 
-   makeMaps_e ( s );
-   EOB = s->nInUse+1;
+   for (pc = (UChar*)(s->ftab) + MTFA_SIZE, i = 255; i >= 0; i--) {
+      if (s->inUse[i]) {
+         *--pc = i;
+      }
+   }
+   s->nInUse = (UChar*)(s->ftab) + MTFA_SIZE - pc;
 
-   for (i = 0; i <= EOB; i++) s->mtfFreq[i] = 0;
-
-   wr = 0;
-   zPend = 0;
-   for (i = 0; i < s->nInUse; i++) yy[i] = (UChar) i;
-
-   for (i = 0; i < s->nblock; i++) {
-      UChar ll_i;
-      AssertD ( wr <= i, "generateMTFValues(1)" );
-      j = ptr[i]-1; if (j < 0) j += s->nblock;
-      ll_i = s->unseqToSeq[block[j]];
-      AssertD ( ll_i < s->nInUse, "generateMTFValues(2a)" );
-
-      if (yy[0] == ll_i) { 
-         zPend++;
-      } else {
-
-         if (zPend > 0) {
-            zPend--;
-            while (True) {
-               if (zPend & 1) {
-                  mtfv[wr] = BZ_RUNB; wr++; 
-                  s->mtfFreq[BZ_RUNB]++; 
-               } else {
-                  mtfv[wr] = BZ_RUNA; wr++; 
-                  s->mtfFreq[BZ_RUNA]++; 
-               }
-               if (zPend < 2) break;
-               zPend = (zPend - 2) / 2;
-            };
-            zPend = 0;
-         }
-         {
-            register UChar  rtmp;
-            register UChar* ryy_j;
-            register UChar  rll_i;
-            rtmp  = yy[1];
-            yy[1] = yy[0];
-            ryy_j = &(yy[1]);
-            rll_i = ll_i;
-            while ( rll_i != rtmp ) {
-               register UChar rtmp2;
-               ryy_j++;
-               rtmp2  = rtmp;
-               rtmp   = *ryy_j;
-               *ryy_j = rtmp2;
-            };
-            yy[0] = rtmp;
-            j = ryy_j - &(yy[0]);
-            mtfv[wr] = j+1; wr++; s->mtfFreq[j+1]++;
-         }
-
+   for (i = 0; pc < (UChar*)(s->ftab) + MTFA_SIZE; i++) {
+      mtfbase[i] = pc;
+      pe = pc + MTFL_SIZE;
+      if (pe > (UChar*)(s->ftab) + MTFA_SIZE)
+         pe = (UChar*)(s->ftab) + MTFA_SIZE;
+      while (pc < pe) {
+         yy[*pc] = i;
+         pc++;
       }
    }
 
-   if (zPend > 0) {
-      zPend--;
-      while (True) {
-         if (zPend & 1) {
-            mtfv[wr] = BZ_RUNB; wr++; 
-            s->mtfFreq[BZ_RUNB]++; 
-         } else {
-            mtfv[wr] = BZ_RUNA; wr++; 
-            s->mtfFreq[BZ_RUNA]++; 
-         }
-         if (zPend < 2) break;
-         zPend = (zPend - 2) / 2;
-      };
-      zPend = 0;
+   for (i = s->nInUse; i >= 0; i--) {
+      s->mtfFreq[i] = 0;
    }
 
-   mtfv[wr] = EOB; wr++; s->mtfFreq[EOB]++;
+   ptr = s->ptr; mtfv = s->mtfv; yy0 = mtfbase[0][0];
+   ptr[s->nblock] = 256;
+   while (True) {
 
-   s->nMTF = wr;
+      AssertD ( mtfv - s->mtfv <= ptr - s->ptr, "generateMTFValues(1)" );
+
+      ll_i = *ptr; ptr++;
+
+      if (yy0 == ll_i) { 
+         zPend = 0;
+         while (ll_i = *ptr, ptr++, yy0 == ll_i) {
+            zPend++;
+         }
+         while (True) {
+            i = (zPend & 1) + BZ_RUNA;
+
+            *mtfv = i; mtfv++; 
+            s->mtfFreq[i]++; 
+
+            if ((zPend -= 2) < 0) break;
+            zPend >>= 1;
+         }
+      }
+      if (ll_i > 255) break;
+      AssertD ( s->inUse[ll_i], "generateMTFValues(2a)" );
+
+      lno = yy[ll_i];
+      yy[yy0] = 0;
+      if (lno == 0) {
+         pc = mtfbase[0];
+         tmp   = yy0;
+         yy0   = pc[1];
+         pc[1] = tmp;
+         i = 2;
+         while ( ll_i != yy0 ) {
+            tmp    = yy0;
+            yy0    = pc[i];
+            pc[i]  = tmp;
+            i++;
+         }
+         *mtfv = i; mtfv++;
+         s->mtfFreq[i]++;
+      } else {
+         mtfbase[0][0] = yy0;
+         pc = mtfbase[lno];
+         yy0 = pc[0];
+         i = 1;
+         while (ll_i != yy0) {
+            tmp   = yy0;
+            yy0   = pc[i];
+            pc[i] = tmp;
+            i++;
+         }
+         i += lno * MTFL_SIZE;
+         *mtfv = i; mtfv++;
+         s->mtfFreq[i]++;
+         do {
+            tmp = mtfbase[lno - 1][MTFL_SIZE - 1];
+            yy[tmp] = lno;
+            mtfbase[lno][0] = tmp;
+            mtfbase[lno - 1]--;
+            lno--;
+         } while (lno != 0);
+         if (mtfbase[0] == (UChar*)(s->ftab)) {
+            lno = (s->nInUse - 1) / MTFL_SIZE;
+            pe = mtfbase[lno];
+            while (lno != 0) {
+               lno--;
+               pc = mtfbase[lno] + MTFL_SIZE;
+               do {
+                  *--pe = *--pc;
+               } while (pc > mtfbase[lno]);
+               mtfbase[lno] = pe;
+            }
+         }
+      }
+   }
+   AssertD ( ptr == s->ptr + s->nblock + 1, "generateMTFValues(2b)" );
+
+   EOB = s->nInUse + 1;
+   *mtfv = EOB; mtfv++; s->mtfFreq[EOB] = 1;
+
+   s->nMTF = mtfv - s->mtfv;
 }
 
 
@@ -235,38 +233,33 @@ void generateMTFValues ( EState* s )
 #define BZ_LESSER_ICOST  0
 #define BZ_GREATER_ICOST 15
 
+typedef
+   struct {
+#ifdef USE_INT64
+      UInt64   len_pack[BZ_MAX_ALPHA_SIZE];
+#else
+      UInt32   len_pack[BZ_MAX_ALPHA_SIZE * 2];
+#endif
+      Int32    code[BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
+      Int32    len[BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
+      Int32    cost[BZ_N_GROUPS];
+      Int32    fave[BZ_N_GROUPS];
+   }
+   ETabs;
+
 static
 void sendMTFValues ( EState* s )
 {
-   Int32 v, t, i, j, gs, ge, totc, bt, bc, iter;
-   Int32 nSelectors, alphaSize, minLen, maxLen, selCtr;
-   Int32 nGroups, nBytes;
-
-   /*--
-   UChar  len [BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
-   is a global since the decoder also needs it.
-
-   Int32  code[BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
-   Int32  rfreq[BZ_N_GROUPS][BZ_MAX_ALPHA_SIZE];
-   are also globals only used in this proc.
-   Made global to keep stack frame size small.
-   --*/
-
-
-   UInt16 cost[BZ_N_GROUPS];
-   Int32  fave[BZ_N_GROUPS];
-
-   UInt16* mtfv = s->mtfv;
+   Int   t;
+   Int   nSelectors, alphaSize;
+   Int   nGroups;
+   ETabs *ftab = (ETabs *)(s->ftab);
+   Int32 iter, nBytes;
 
    if (s->verbosity >= 3)
       VPrintf3( "      %d in block, %d after MTF & 1-2 coding, "
                 "%d+2 syms in use\n", 
                 s->nblock, s->nMTF, s->nInUse );
-
-   alphaSize = s->nInUse+2;
-   for (t = 0; t < BZ_N_GROUPS; t++)
-      for (v = 0; v < alphaSize; v++)
-         s->len[t][v] = BZ_GREATER_ICOST;
 
    /*--- Decide how many coding tables to use ---*/
    AssertH ( s->nMTF > 0, 3001 );
@@ -276,42 +269,51 @@ void sendMTFValues ( EState* s )
    if (s->nMTF < 2400) nGroups = 5; else
                        nGroups = 6;
 
-   /*--- Generate an initial set of coding tables ---*/
-   { 
-      Int32 nPart, remF, tFreq, aFreq;
+   alphaSize = s->nInUse+2;
+   if (alphaSize <= 0) return;
 
+   /*--- Generate an initial set of coding tables ---*/
+   {
+      Int   t, v;
+      Int32 nPart, remF, tFreq, aFreq;
+      Int32 gs, ge;
+   
+      for (t = 0; t < nGroups; t++)
+         for (v = 0; v < alphaSize; v++)
+            ftab->len[t][v] = BZ_GREATER_ICOST;
+   
       nPart = nGroups;
       remF  = s->nMTF;
       gs = 0;
       while (nPart > 0) {
          tFreq = remF / nPart;
-         ge = gs-1;
+         ge = gs - 1;
          aFreq = 0;
-         while (aFreq < tFreq && ge < alphaSize-1) {
+         while (aFreq < tFreq && ge < alphaSize - 1) {
             ge++;
             aFreq += s->mtfFreq[ge];
          }
-
+   
          if (ge > gs 
              && nPart != nGroups && nPart != 1 
-             && ((nGroups-nPart) % 2 == 1)) {
+             && ((nGroups - nPart) % 2 == 1)) {
             aFreq -= s->mtfFreq[ge];
             ge--;
          }
-
+   
          if (s->verbosity >= 3)
             VPrintf5( "      initial group %d, [%d .. %d], "
                       "has %d syms (%4.1f%%)\n",
                       nPart, gs, ge, aFreq, 
                       (100.0 * (float)aFreq) / (float)(s->nMTF) );
- 
-         for (v = 0; v < alphaSize; v++)
-            if (v >= gs && v <= ge) 
-               s->len[nPart-1][v] = BZ_LESSER_ICOST; else
-               s->len[nPart-1][v] = BZ_GREATER_ICOST;
- 
+   
+         while (gs <= ge) {
+            ftab->len[nPart - 1][gs] = BZ_LESSER_ICOST;
+            gs++;
+         }
+   
          nPart--;
-         gs = ge+1;
+         gs = ge + 1;
          remF -= aFreq;
       }
    }
@@ -320,52 +322,55 @@ void sendMTFValues ( EState* s )
       Iterate up to BZ_N_ITERS times to improve the tables.
    ---*/
    for (iter = 0; iter < BZ_N_ITERS; iter++) {
-
-      for (t = 0; t < nGroups; t++) fave[t] = 0;
-
+      UChar  *sel = (UChar *)(s->arr2);
+      UInt16 *emtfv = s->mtfv + s->nMTF;
+      UInt16 *gs = s->mtfv;
+      UInt16 *ge = s->mtfv + BZ_G_SIZE;
+      Int    t, v;
+      Int32  totc = 0;
+   
+      for (t = 0; t < nGroups; t++) ftab->fave[t] = 0;
+   
       for (t = 0; t < nGroups; t++)
          for (v = 0; v < alphaSize; v++)
-            s->rfreq[t][v] = 0;
-
-      /*---
-        Set up an auxiliary length table which is used to fast-track
-	the common case (nGroups == 6). 
-      ---*/
+            ftab->code[t][v] = 0;
+   
       if (nGroups == 6) {
+         /*---
+           Set up an auxiliary length table which is used to fast-track
+           the common case (nGroups == 6). 
+         ---*/
          for (v = 0; v < alphaSize; v++) {
-            s->len_pack[v][0] = (s->len[1][v] << 16) | s->len[0][v];
-            s->len_pack[v][1] = (s->len[3][v] << 16) | s->len[2][v];
-            s->len_pack[v][2] = (s->len[5][v] << 16) | s->len[4][v];
-	 }
-      }
+#ifdef USE_INT64
+            ftab->len_pack[v] = ((Int64)(ftab->len[5][v]) << 50) | ((Int64)(ftab->len[4][v]) << 40) |
+                                ((Int64)(ftab->len[3][v]) << 30) | ((Int64)(ftab->len[2][v]) << 20) |
+                                ((Int64)(ftab->len[1][v]) << 10) | (Int64)(ftab->len[0][v]);
+#else
+            ftab->len_pack[v * 2] = (ftab->len[2][v] << 20) | (ftab->len[1][v] << 10) | ftab->len[0][v];
+            ftab->len_pack[v * 2 + 1] = (ftab->len[5][v] << 20) | (ftab->len[4][v] << 10) | ftab->len[3][v];
+#endif
+         }
+         while (ge <= emtfv) {
+            Int    bt;
+            Int32  bc;
+#ifdef USE_INT64
+            Int64 cost05 = 0;
+   
+#           define BZ_ITER(nn) (cost05 += ftab->len_pack[gs[nn]])
+#else
+            UInt16 *gi = gs;
+            Int32 cost02 = 0, cost35 = 0;
+   
+#           define BZ_ITER(nn)                                     \
+               cost02 += ((Int32 *)(ftab->len_pack))[*gi * 2];     \
+               cost35 += ((Int32 *)(ftab->len_pack))[*gi * 2 + 1]; \
+               gi++;                                               \
 
-      nSelectors = 0;
-      totc = 0;
-      gs = 0;
-      while (True) {
+#endif
 
-         /*--- Set group start & end marks. --*/
-         if (gs >= s->nMTF) break;
-         ge = gs + BZ_G_SIZE - 1; 
-         if (ge >= s->nMTF) ge = s->nMTF-1;
-
-         /*-- 
-            Calculate the cost of this group as coded
-            by each of the coding tables.
-         --*/
-         for (t = 0; t < nGroups; t++) cost[t] = 0;
-
-         if (nGroups == 6 && 50 == ge-gs+1) {
-            /*--- fast track the common case ---*/
-            register UInt32 cost01, cost23, cost45;
-            register UInt16 icv;
-            cost01 = cost23 = cost45 = 0;
-
-#           define BZ_ITER(nn)                \
-               icv = mtfv[gs+(nn)];           \
-               cost01 += s->len_pack[icv][0]; \
-               cost23 += s->len_pack[icv][1]; \
-               cost45 += s->len_pack[icv][2]; \
+#if BZ_G_SIZE != 50
+#error BZ_G_SIZE != 50: Next code is incorrect
+#endif
 
             BZ_ITER(0);  BZ_ITER(1);  BZ_ITER(2);  BZ_ITER(3);  BZ_ITER(4);
             BZ_ITER(5);  BZ_ITER(6);  BZ_ITER(7);  BZ_ITER(8);  BZ_ITER(9);
@@ -377,41 +382,106 @@ void sendMTFValues ( EState* s )
             BZ_ITER(35); BZ_ITER(36); BZ_ITER(37); BZ_ITER(38); BZ_ITER(39);
             BZ_ITER(40); BZ_ITER(41); BZ_ITER(42); BZ_ITER(43); BZ_ITER(44);
             BZ_ITER(45); BZ_ITER(46); BZ_ITER(47); BZ_ITER(48); BZ_ITER(49);
-
+   
 #           undef BZ_ITER
-
-            cost[0] = cost01 & 0xffff; cost[1] = cost01 >> 16;
-            cost[2] = cost23 & 0xffff; cost[3] = cost23 >> 16;
-            cost[4] = cost45 & 0xffff; cost[5] = cost45 >> 16;
-
-         } else {
-	    /*--- slow version which correctly handles all situations ---*/
-            for (i = gs; i <= ge; i++) { 
-               UInt16 icv = mtfv[i];
-               for (t = 0; t < nGroups; t++) cost[t] += s->len[t][icv];
+   
+            /*-- 
+               Find the coding table which is best for this group,
+               and record its identity in the selector table.
+            --*/
+#ifdef USE_INT64
+            bc = cost05 & 0x3ff; bt = 0;
+            for (t = 1; t < nGroups; t++) {
+               cost05 >>= 10;
+               if ((Int32)(cost05 & 0x3ff) < bc) { bc = (Int32)(cost05 & 0x3ff); bt = t; };
             }
+#else
+            bc = cost02 & 0x3ff; ftab->cost[1] = (cost02 >> 10) & 0x3ff; ftab->cost[2] = cost02 >> 20;
+            ftab->cost[3] = cost35 & 0x3ff; ftab->cost[4] = (cost35 >> 10) & 0x3ff; ftab->cost[5] = cost35 >> 20;
+            bt = 0;
+            for (t = 1; t < nGroups; t++)
+               if (ftab->cost[t] < bc) { bc = ftab->cost[t]; bt = t; };
+#endif
+    
+            totc += bc;
+            ftab->fave[bt]++;
+            *sel++ = bt;
+   
+            /*-- 
+               Increment the symbol frequencies for the selected table.
+             --*/
+            {
+               /*--- fast track the common case ---*/
+               Int32 *ifr = &(ftab->code[bt][0]);
+   
+#              define BZ_ITUR(nn) ifr[gs[nn]]++
+
+#if BZ_G_SIZE != 50
+#error BZ_G_SIZE != 50: Next code is incorrect
+#endif
+   
+               BZ_ITUR(0);  BZ_ITUR(1);  BZ_ITUR(2);  BZ_ITUR(3);  BZ_ITUR(4);
+               BZ_ITUR(5);  BZ_ITUR(6);  BZ_ITUR(7);  BZ_ITUR(8);  BZ_ITUR(9);
+               BZ_ITUR(10); BZ_ITUR(11); BZ_ITUR(12); BZ_ITUR(13); BZ_ITUR(14);
+               BZ_ITUR(15); BZ_ITUR(16); BZ_ITUR(17); BZ_ITUR(18); BZ_ITUR(19);
+               BZ_ITUR(20); BZ_ITUR(21); BZ_ITUR(22); BZ_ITUR(23); BZ_ITUR(24);
+               BZ_ITUR(25); BZ_ITUR(26); BZ_ITUR(27); BZ_ITUR(28); BZ_ITUR(29);
+               BZ_ITUR(30); BZ_ITUR(31); BZ_ITUR(32); BZ_ITUR(33); BZ_ITUR(34);
+               BZ_ITUR(35); BZ_ITUR(36); BZ_ITUR(37); BZ_ITUR(38); BZ_ITUR(39);
+               BZ_ITUR(40); BZ_ITUR(41); BZ_ITUR(42); BZ_ITUR(43); BZ_ITUR(44);
+               BZ_ITUR(45); BZ_ITUR(46); BZ_ITUR(47); BZ_ITUR(48); BZ_ITUR(49);
+   
+#              undef BZ_ITUR
+   
+            }
+   
+            gs = ge;
+            ge += BZ_G_SIZE;
          }
- 
+      }
+   
+      /*--
+         Groups of size BZ_G_SIZE when nGroups != 6
+      --*/
+      while (ge <= emtfv) {
+         UInt16 *gi;
+         Int    bt;
+         Int32  bc;
+   
+         /*-- 
+            Calculate the cost of this group as coded
+            by each of the coding tables.
+         --*/
+         for (t = 0; t < nGroups; t++) ftab->cost[t] = 0;
+         for (gi = gs; gi < ge; gi++) { 
+            Int icv = *gi;
+            for (t = 0; t < nGroups; t++) ftab->cost[t] += ftab->len[t][icv];
+         }
+    
          /*-- 
             Find the coding table which is best for this group,
             and record its identity in the selector table.
          --*/
-         bc = 999999999; bt = -1;
-         for (t = 0; t < nGroups; t++)
-            if (cost[t] < bc) { bc = cost[t]; bt = t; };
+         bc = ftab->cost[0]; bt = 0;
+         for (t = 1; t < nGroups; t++)
+            if (ftab->cost[t] < bc) { bc = ftab->cost[t]; bt = t; };
          totc += bc;
-         fave[bt]++;
-         s->selector[nSelectors] = bt;
-         nSelectors++;
-
+         ftab->fave[bt]++;
+         *sel++ = bt;
+   
          /*-- 
             Increment the symbol frequencies for the selected table.
           --*/
-         if (nGroups == 6 && 50 == ge-gs+1) {
+         {
             /*--- fast track the common case ---*/
+            Int32 *ifr = &(ftab->code[bt][0]);
+   
+#           define BZ_ITUR(nn) ifr[gs[nn]]++
 
-#           define BZ_ITUR(nn) s->rfreq[bt][ mtfv[gs+(nn)] ]++
-
+#if BZ_G_SIZE != 50
+#error BZ_G_SIZE != 50: Next code is incorrect
+#endif
+   
             BZ_ITUR(0);  BZ_ITUR(1);  BZ_ITUR(2);  BZ_ITUR(3);  BZ_ITUR(4);
             BZ_ITUR(5);  BZ_ITUR(6);  BZ_ITUR(7);  BZ_ITUR(8);  BZ_ITUR(9);
             BZ_ITUR(10); BZ_ITUR(11); BZ_ITUR(12); BZ_ITUR(13); BZ_ITUR(14);
@@ -422,179 +492,329 @@ void sendMTFValues ( EState* s )
             BZ_ITUR(35); BZ_ITUR(36); BZ_ITUR(37); BZ_ITUR(38); BZ_ITUR(39);
             BZ_ITUR(40); BZ_ITUR(41); BZ_ITUR(42); BZ_ITUR(43); BZ_ITUR(44);
             BZ_ITUR(45); BZ_ITUR(46); BZ_ITUR(47); BZ_ITUR(48); BZ_ITUR(49);
-
+   
 #           undef BZ_ITUR
-
-         } else {
-	    /*--- slow version which correctly handles all situations ---*/
-            for (i = gs; i <= ge; i++)
-               s->rfreq[bt][ mtfv[i] ]++;
-         }
-
-         gs = ge+1;
+            }
+      
+         gs = ge;
+         ge += BZ_G_SIZE;
       }
+   
+      /*--
+         If last group is not full.
+      --*/
+      if (gs < emtfv) {
+         UInt16 *gi;
+         Int    bt;
+         Int32  bc;
+   
+         /*-- 
+            Calculate the cost of this group as coded
+            by each of the coding tables.
+         --*/
+         for (t = 0; t < nGroups; t++) ftab->cost[t] = 0;
+         for (gi = gs; gi < emtfv; gi++) { 
+            Int icv = *gi;
+            for (t = 0; t < nGroups; t++) ftab->cost[t] += ftab->len[t][icv];
+         }
+    
+         /*-- 
+            Find the coding table which is best for this group,
+            and record its identity in the selector table.
+         --*/
+         bc = ftab->cost[0]; bt = 0;
+         for (t = 1; t < nGroups; t++)
+            if (ftab->cost[t] < bc) { bc = ftab->cost[t]; bt = t; };
+         totc += bc;
+         ftab->fave[bt]++;
+         *sel++ = bt;
+   
+         /*-- 
+            Increment the symbol frequencies for the selected table.
+          --*/
+         {
+            /*--- slow version which correctly handles all situations ---*/
+            Int32 *ifr = &(ftab->code[bt][0]);
+   
+            for (; gs < emtfv; gs++) ifr[*gs]++;
+         }
+      }
+   
+   
       if (s->verbosity >= 3) {
          VPrintf2 ( "      pass %d: size is %d, grp uses are ", 
-                   iter+1, totc/8 );
+                   iter + 1, totc / 8 );
          for (t = 0; t < nGroups; t++)
-            VPrintf1 ( "%d ", fave[t] );
+            VPrintf1 ( "%d ", ftab->fave[t] );
          VPrintf0 ( "\n" );
       }
-
+   
+      nSelectors = sel - (UChar *)(s->arr2);
+   
       /*--
         Recompute the tables based on the accumulated frequencies.
       --*/
       /* maxLen was changed from 20 to 17 in bzip2-1.0.3.  See 
          comment in huffman.c for details. */
       for (t = 0; t < nGroups; t++)
-         BZ2_hbMakeCodeLengths ( &(s->len[t][0]), &(s->rfreq[t][0]), 
-                                 alphaSize, 17 /*20*/ );
+         BZ2_hbMakeCodeLengths ( &(ftab->len[t][0]), &(ftab->code[t][0]), alphaSize, BZ_LIMIT_CODE_LEN /*20*/ );
    }
-
 
    AssertH( nGroups < 8, 3002 );
    AssertH( nSelectors < 32768 &&
-            nSelectors <= (2 + (900000 / BZ_G_SIZE)),
+            nSelectors <= BZ_MAX_SELECTORS,
             3003 );
 
-
    /*--- Compute MTF values for the selectors. ---*/
-   {
-      UChar pos[BZ_N_GROUPS], ll_i, tmp2, tmp;
-      for (i = 0; i < nGroups; i++) pos[i] = i;
-      for (i = 0; i < nSelectors; i++) {
-         ll_i = s->selector[i];
-         j = 0;
-         tmp = pos[j];
-         while ( ll_i != tmp ) {
-            j++;
-            tmp2 = tmp;
-            tmp = pos[j];
-            pos[j] = tmp2;
-         };
-         pos[0] = tmp;
-         s->selectorMtf[i] = j;
-      }
-   };
+#if BZ_N_GROUPS > 6
+#error BZ_N_GROUPS > 6: Next code is incorrect
+#endif
 
-   /*--- Assign actual codes for the tables. --*/
-   for (t = 0; t < nGroups; t++) {
-      minLen = 32;
-      maxLen = 0;
-      for (i = 0; i < alphaSize; i++) {
-         if (s->len[t][i] > maxLen) maxLen = s->len[t][i];
-         if (s->len[t][i] < minLen) minLen = s->len[t][i];
+   {
+      UChar  *sel = (UChar *)(s->arr2);
+      UInt   pos0 = 0;
+      UInt   pos1 = 1;
+      UInt   pos2 = 2;
+      UInt   pos3 = 3;
+      UInt   pos4 = 4;
+      UInt   pos5 = 5;
+   
+      sel[nSelectors] = 8;
+      while(1) {
+         UInt ll_i = *sel++;
+         if (ll_i == pos0) {
+            sel[BZ_MAX_SELECTORS - 1] = 1;
+            continue;
+         }
+         if (ll_i == pos1) {
+            sel[BZ_MAX_SELECTORS - 1] = 2;
+            pos1 = pos0;
+            pos0 = ll_i;
+            continue;
+         }
+         if (ll_i == pos2) {
+            sel[BZ_MAX_SELECTORS - 1] = 3;
+            pos2 = pos1;
+            pos1 = pos0;
+            pos0 = ll_i;
+            continue;
+         }
+         if (ll_i == pos3) {
+            sel[BZ_MAX_SELECTORS - 1] = 4;
+            pos3 = pos2;
+            pos2 = pos1;
+            pos1 = pos0;
+            pos0 = ll_i;
+            continue;
+         }
+         if (ll_i == pos4) {
+            sel[BZ_MAX_SELECTORS - 1] = 5;
+            pos4 = pos3;
+            pos3 = pos2;
+            pos2 = pos1;
+            pos1 = pos0;
+            pos0 = ll_i;
+            continue;
+         }
+         if (ll_i == pos5) {
+            sel[BZ_MAX_SELECTORS - 1] = 6;
+            pos5 = pos4;
+            pos4 = pos3;
+            pos3 = pos2;
+            pos2 = pos1;
+            pos1 = pos0;
+            pos0 = ll_i;
+            continue;
+         }
+         break;
       }
-      AssertH ( !(maxLen > 17 /*20*/ ), 3004 );
-      AssertH ( !(minLen < 1),  3005 );
-      BZ2_hbAssignCodes ( &(s->code[t][0]), &(s->len[t][0]), 
-                          minLen, maxLen, alphaSize );
+   }
+
+    /*--- Assign actual codes for the tables. --*/
+   {
+      Int32  *clen_row = &(ftab->len[0][0]);
+      Int    t, v;
+   
+      for (t = 0; t < nGroups; t++) {
+         Int32 minLen = 32;
+         Int32 maxLen = 0;
+   
+         for (v = 0; v < alphaSize; v++) {
+            if (clen_row[v] > maxLen) maxLen = clen_row[v];
+            if (clen_row[v] < minLen) minLen = clen_row[v];
+         }
+         AssertH ( !(maxLen > BZ_LIMIT_CODE_LEN /*20*/ ), 3004 );
+         AssertH ( !(minLen < 1),  3005 );
+         BZ2_hbAssignCodes ( clen_row - sizeof(ftab->code) / sizeof(Int32), clen_row, minLen, maxLen, alphaSize );
+         clen_row += BZ_MAX_ALPHA_SIZE;
+      }
    }
 
    /*--- Transmit the mapping table. ---*/
+   nBytes = s->numZ;
    { 
-      Bool inUse16[16];
-      for (i = 0; i < 16; i++) {
-          inUse16[i] = False;
+      Int   i, j;
+      Int   v, t;
+
+      for (i = 0, t = 0; i < 16; i++) {
+          t <<= 1;
           for (j = 0; j < 16; j++)
-             if (s->inUse[i * 16 + j]) inUse16[i] = True;
+             t |= s->inUse[i * 16 + j];
       }
-     
-      nBytes = s->numZ;
-      for (i = 0; i < 16; i++)
-         if (inUse16[i]) bsW(s,1,1); else bsW(s,1,0);
+      bsW(s, 16, t);
 
-      for (i = 0; i < 16; i++)
-         if (inUse16[i])
-            for (j = 0; j < 16; j++) {
-               if (s->inUse[i * 16 + j]) bsW(s,1,1); else bsW(s,1,0);
+      for (i = 0; i < 16; i++) {
+         if (t & 0x8000) {
+            for (j = 0, v = 0; j < 16; j++) {
+               v = (v << 1) | s->inUse[i * 16 + j];
             }
-
-      if (s->verbosity >= 3) 
-         VPrintf1( "      bytes: mapping %d, ", s->numZ-nBytes );
+            bsW(s, 16, v);
+         }
+         t <<= 1;
+      }
    }
+   if (s->verbosity >= 3) 
+      VPrintf1( "      bytes: mapping %d, ", s->numZ - nBytes );
 
    /*--- Now the selectors. ---*/
    nBytes = s->numZ;
    bsW ( s, 3, nGroups );
    bsW ( s, 15, nSelectors );
-   for (i = 0; i < nSelectors; i++) { 
-      for (j = 0; j < s->selectorMtf[i]; j++) bsW(s,1,1);
-      bsW(s,1,0);
+   {
+      UChar *sel, *esel;
+
+      for(sel = (UChar *)(s->arr2) + BZ_MAX_SELECTORS, esel = sel + nSelectors; sel < esel; sel++) {
+         bsW(s, *sel, (1 << *sel) - 2);
+      }
    }
    if (s->verbosity >= 3)
-      VPrintf1( "selectors %d, ", s->numZ-nBytes );
+      VPrintf1( "selectors %d, ", s->numZ - nBytes );
 
    /*--- Now the coding tables. ---*/
    nBytes = s->numZ;
 
    for (t = 0; t < nGroups; t++) {
-      Int32 curr = s->len[t][0];
+      Int   v;
+      Int32 curr = ftab->len[t][0];
+
       bsW ( s, 5, curr );
-      for (i = 0; i < alphaSize; i++) {
-         while (curr < s->len[t][i]) { bsW(s,2,2); curr++; /* 10 */ };
-         while (curr > s->len[t][i]) { bsW(s,2,3); curr--; /* 11 */ };
+      for (v = 0; v < alphaSize; v++) {
+         while (curr < ftab->len[t][v]) { bsW(s,2,2); curr++; /* 10 */ };
+         while (curr > ftab->len[t][v]) { bsW(s,2,3); curr--; /* 11 */ };
          bsW ( s, 1, 0 );
       }
    }
 
    if (s->verbosity >= 3)
-      VPrintf1 ( "code lengths %d, ", s->numZ-nBytes );
+      VPrintf1 ( "code lengths %d, ", s->numZ - nBytes );
 
    /*--- And finally, the block data proper ---*/
+
    nBytes = s->numZ;
-   selCtr = 0;
-   gs = 0;
-   while (True) {
-      if (gs >= s->nMTF) break;
-      ge = gs + BZ_G_SIZE - 1; 
-      if (ge >= s->nMTF) ge = s->nMTF-1;
-      AssertH ( s->selector[selCtr] < nGroups, 3006 );
+   {
+      UInt16 *ge = s->mtfv + BZ_G_SIZE;
+      UInt16 *emtfv = s->mtfv + s->nMTF;
+      UChar  *sel = (UChar *)(s->arr2);
 
-      if (nGroups == 6 && 50 == ge-gs+1) {
-            /*--- fast track the common case ---*/
-            UInt16 mtfv_i;
-            UChar* s_len_sel_selCtr 
-               = &(s->len[s->selector[selCtr]][0]);
-            Int32* s_code_sel_selCtr
-               = &(s->code[s->selector[selCtr]][0]);
+#if BZ_LIMIT_CODE_LEN == 17
+      UChar  *czbits = &(s->zbits[s->numZ]);
+      UInt   bsBuff = s->bsBuff;
+      Int32  bsLive = s->bsLive;
+#ifdef USE_INT64
+#define bsWc(n,v)                             \
+{                                             \
+   if (bsLive <= 16) {                        \
+      czbits[0] = (UChar)(bsBuff >> 56);      \
+      czbits[1] = (UChar)(bsBuff >> 48);      \
+      czbits[2] = (UChar)(bsBuff >> 40);      \
+      czbits[3] = (UChar)(bsBuff >> 32);      \
+      czbits[4] = (UChar)(bsBuff >> 24);      \
+      czbits[5] = (UChar)(bsBuff >> 16);      \
+      czbits += 6;                            \
+      bsBuff <<= 48;                          \
+      bsLive += 48;                           \
+   }                                          \
+   bsBuff |= (UInt)(v) << (bsLive -= (n));    \
+}
+#else
+#define bsWc(n,v)                             \
+{                                             \
+   if (bsLive <= 16) {                        \
+      czbits[0] = (UChar)(bsBuff >> 24);      \
+      czbits[1] = (UChar)(bsBuff >> 16);      \
+      if (bsLive > 8) {                       \
+         czbits += 2;                         \
+         bsBuff <<= 16;                       \
+         bsLive += 16;                        \
+      } else {                                \
+         czbits[2] = (UChar)(bsBuff >> 8);    \
+         czbits += 3;                         \
+         bsBuff <<= 24;                       \
+         bsLive += 24;                        \
+      }                                       \
+   }                                          \
+   bsBuff |= (UInt)(v) << (bsLive -= (n));    \
+}
+#endif
+#else
+#define bsWc(n,v) bsW(s,(n),(v))
+#endif
+   
+      //--- fast version for full group ---
+      while (ge <= emtfv) {
+         Int32* code_row;
+         AssertH ( *sel < nGroups, 3006 );
+         code_row = &(ftab->code[*sel][0]);
+   
+#        define BZ_ITAH(nn) bsWc(code_row[ge[nn - BZ_G_SIZE] + sizeof(ftab->code) / sizeof(Int32)], code_row[ge[nn - BZ_G_SIZE]])
 
-#           define BZ_ITAH(nn)                      \
-               mtfv_i = mtfv[gs+(nn)];              \
-               bsW ( s,                             \
-                     s_len_sel_selCtr[mtfv_i],      \
-                     s_code_sel_selCtr[mtfv_i] )
-
-            BZ_ITAH(0);  BZ_ITAH(1);  BZ_ITAH(2);  BZ_ITAH(3);  BZ_ITAH(4);
-            BZ_ITAH(5);  BZ_ITAH(6);  BZ_ITAH(7);  BZ_ITAH(8);  BZ_ITAH(9);
-            BZ_ITAH(10); BZ_ITAH(11); BZ_ITAH(12); BZ_ITAH(13); BZ_ITAH(14);
-            BZ_ITAH(15); BZ_ITAH(16); BZ_ITAH(17); BZ_ITAH(18); BZ_ITAH(19);
-            BZ_ITAH(20); BZ_ITAH(21); BZ_ITAH(22); BZ_ITAH(23); BZ_ITAH(24);
-            BZ_ITAH(25); BZ_ITAH(26); BZ_ITAH(27); BZ_ITAH(28); BZ_ITAH(29);
-            BZ_ITAH(30); BZ_ITAH(31); BZ_ITAH(32); BZ_ITAH(33); BZ_ITAH(34);
-            BZ_ITAH(35); BZ_ITAH(36); BZ_ITAH(37); BZ_ITAH(38); BZ_ITAH(39);
-            BZ_ITAH(40); BZ_ITAH(41); BZ_ITAH(42); BZ_ITAH(43); BZ_ITAH(44);
-            BZ_ITAH(45); BZ_ITAH(46); BZ_ITAH(47); BZ_ITAH(48); BZ_ITAH(49);
-
-#           undef BZ_ITAH
-
-      } else {
-	 /*--- slow version which correctly handles all situations ---*/
-         for (i = gs; i <= ge; i++) {
-            bsW ( s, 
-                  s->len  [s->selector[selCtr]] [mtfv[i]],
-                  s->code [s->selector[selCtr]] [mtfv[i]] );
-         }
+#if BZ_G_SIZE != 50
+#error BZ_G_SIZE != 50: Next code is incorrect
+#endif
+   
+         BZ_ITAH(0);  BZ_ITAH(1);  BZ_ITAH(2);  BZ_ITAH(3);  BZ_ITAH(4);
+         BZ_ITAH(5);  BZ_ITAH(6);  BZ_ITAH(7);  BZ_ITAH(8);  BZ_ITAH(9);
+         BZ_ITAH(10); BZ_ITAH(11); BZ_ITAH(12); BZ_ITAH(13); BZ_ITAH(14);
+         BZ_ITAH(15); BZ_ITAH(16); BZ_ITAH(17); BZ_ITAH(18); BZ_ITAH(19);
+         BZ_ITAH(20); BZ_ITAH(21); BZ_ITAH(22); BZ_ITAH(23); BZ_ITAH(24);
+         BZ_ITAH(25); BZ_ITAH(26); BZ_ITAH(27); BZ_ITAH(28); BZ_ITAH(29);
+         BZ_ITAH(30); BZ_ITAH(31); BZ_ITAH(32); BZ_ITAH(33); BZ_ITAH(34);
+         BZ_ITAH(35); BZ_ITAH(36); BZ_ITAH(37); BZ_ITAH(38); BZ_ITAH(39);
+         BZ_ITAH(40); BZ_ITAH(41); BZ_ITAH(42); BZ_ITAH(43); BZ_ITAH(44);
+         BZ_ITAH(45); BZ_ITAH(46); BZ_ITAH(47); BZ_ITAH(48); BZ_ITAH(49);
+   
+#        undef BZ_ITAH
+   
+         ge += BZ_G_SIZE;
+         sel++;
       }
 
+      ge -= BZ_G_SIZE;
+      if (ge < emtfv) {
+         Int32* code_row;
+         AssertH ( *sel < nGroups, 3006 );
+         code_row = &(ftab->code[*sel][0]);
 
-      gs = ge+1;
-      selCtr++;
+	 //--- slow version for last group ---
+         for (; ge < emtfv; ge++) {
+            bsWc(code_row[*ge + sizeof(ftab->code) / sizeof(Int32)], code_row[*ge]);
+         }
+         sel++;
+      }
+   
+      AssertH( sel - (UChar *)(s->arr2) == nSelectors, 3007 );
+   
+#if BZ_LIMIT_CODE_LEN == 17
+      s->bsLive = bsLive;
+      s->bsBuff = bsBuff;
+      s->numZ = czbits - s->zbits;
+#endif
    }
-   AssertH( selCtr == nSelectors, 3007 );
+
+#undef bsWc
 
    if (s->verbosity >= 3)
-      VPrintf1( "codes %d\n", s->numZ-nBytes );
+      VPrintf1( "codes %d\n", s->numZ - nBytes );
 }
 
 
@@ -614,24 +834,20 @@ void BZ2_compressBlock ( EState* s, Bool is_last_block )
                    s->blockNo, s->blockCRC, s->combinedCRC, s->nblock );
 
       BZ2_blockSort ( s );
+      generateMTFValues ( s );
    }
-
-   s->zbits = (UChar*) (&((UChar*)s->arr2)[s->nblock]);
 
    /*-- If this is the first block, create the stream header. --*/
    if (s->blockNo == 1) {
       BZ2_bsInitWrite ( s );
-      bsPutUChar ( s, BZ_HDR_B );
-      bsPutUChar ( s, BZ_HDR_Z );
-      bsPutUChar ( s, BZ_HDR_h );
-      bsPutUChar ( s, (UChar)(BZ_HDR_0 + s->blockSize100k) );
+      bsW( s, 24, (((BZ_HDR_B << 8) | BZ_HDR_Z) << 8) | BZ_HDR_h);
+      bsW( s, 8, BZ_HDR_0 + s->blockSize100k );
    }
 
    if (s->nblock > 0) {
 
-      bsPutUChar ( s, 0x31 ); bsPutUChar ( s, 0x41 );
-      bsPutUChar ( s, 0x59 ); bsPutUChar ( s, 0x26 );
-      bsPutUChar ( s, 0x53 ); bsPutUChar ( s, 0x59 );
+      bsW( s, 24, 0x314159);
+      bsW( s, 24, 0x265359);
 
       /*-- Now the block's CRC, so it is in a known place. --*/
       bsPutUInt32 ( s, s->blockCRC );
@@ -648,7 +864,6 @@ void BZ2_compressBlock ( EState* s, Bool is_last_block )
       bsW(s,1,0);
 
       bsW ( s, 24, s->origPtr );
-      generateMTFValues ( s );
       sendMTFValues ( s );
    }
 
@@ -656,9 +871,8 @@ void BZ2_compressBlock ( EState* s, Bool is_last_block )
    /*-- If this is the last block, add the stream trailer. --*/
    if (is_last_block) {
 
-      bsPutUChar ( s, 0x17 ); bsPutUChar ( s, 0x72 );
-      bsPutUChar ( s, 0x45 ); bsPutUChar ( s, 0x38 );
-      bsPutUChar ( s, 0x50 ); bsPutUChar ( s, 0x90 );
+      bsW( s, 24, 0x177245);
+      bsW( s, 24, 0x385090);
       bsPutUInt32 ( s, s->combinedCRC );
       if (s->verbosity >= 2)
          VPrintf1( "    final combined CRC = 0x%08x\n   ", s->combinedCRC );

@@ -23,216 +23,303 @@
 
 
 /*---------------------------------------------------*/
-static
-void makeMaps_d ( DState* s )
-{
-   Int32 i;
-   s->nInUse = 0;
-   for (i = 0; i < 256; i++)
-      if (s->inUse[i]) {
-         s->seqToUnseq[s->nInUse] = i;
-         s->nInUse++;
-      }
-}
-
-
-/*---------------------------------------------------*/
 #define RETURN(rrr)                               \
-   { retVal = rrr; goto save_state_and_return; };
+   { goto save_state_and_return; };
+
+#define RETERR(rrr)                               \
+   { retVal = rrr; goto error_return; };
 
 #define GET_BITS(lll,vvv,nnn)                     \
-   case lll: s->state = lll;                      \
    while (True) {                                 \
-      if (s->bsLive >= nnn) {                     \
+      if (bsLive >= nnn) {                        \
          UInt32 v;                                \
-         v = (s->bsBuff >>                        \
-             (s->bsLive-nnn)) & ((1 << nnn)-1);   \
-         s->bsLive -= nnn;                        \
+         v = (bsBuff >>                           \
+             (bsLive-nnn)) & ((1 << nnn)-1);      \
+         bsLive -= nnn;                           \
          vvv = v;                                 \
          break;                                   \
       }                                           \
-      if (s->strm->avail_in == 0) RETURN(BZ_OK);  \
-      s->bsBuff                                   \
-         = (s->bsBuff << 8) |                     \
-           ((UInt32)                              \
-              (*((UChar*)(s->strm->next_in))));   \
-      s->bsLive += 8;                             \
-      s->strm->next_in++;                         \
-      s->strm->avail_in--;                        \
-      s->strm->total_in_lo32++;                   \
-      if (s->strm->total_in_lo32 == 0)            \
-         s->strm->total_in_hi32++;                \
+      case lll:                                   \
+      if (bsPtr == bsEnd) {                       \
+         s->state = lll;                          \
+         RETURN(BZ_OK);                           \
+      }                                           \
+      bsBuff                                      \
+         = (bsBuff << 8) | (UInt32)(*bsPtr);      \
+      bsLive += 8;                                \
+      bsPtr++;                                    \
    }
 
-#define GET_UCHAR(lll,uuu)                        \
-   GET_BITS(lll,uuu,8)
+/* reduced version of GET_BITS when nnn <= 8 */
+#define GET_BITS_SMALL(lll,vvv,nnn)               \
+   do {                                           \
+      if ((bsLive -= nnn) < 0) {                  \
+         case lll:                                \
+         if (bsPtr == bsEnd) {                    \
+            s->state = lll;                       \
+            RETURN(BZ_OK);                        \
+         }                                        \
+         bsBuff                                   \
+            = (bsBuff << 8) | (UInt32)(*bsPtr);   \
+         bsLive += 8;                             \
+         bsPtr++;                                 \
+      }                                           \
+      {                                           \
+         UInt32 v;                                \
+         v = (bsBuff >>                           \
+             (bsLive)) & ((1 << nnn)-1);          \
+         vvv = v;                                 \
+      }                                           \
+   } while(False);
+
+/* reduced version of GET_BITS when nnn == 8 */
+#define GET_UCHAR(lll,vvv)                        \
+   do {                                           \
+      case lll:                                   \
+      if (bsPtr == bsEnd) {                       \
+         s->state = lll;                          \
+         RETURN(BZ_OK);                           \
+      }                                           \
+      bsBuff                                      \
+         = (bsBuff << 8) | (UInt32)(*bsPtr);      \
+      bsPtr++;                                    \
+      {                                           \
+         UInt32 v;                                \
+         v = (bsBuff >> bsLive) & ((1 << 8) - 1); \
+         vvv = v;                                 \
+         break;                                   \
+      }                                           \
+   } while(False);
 
 #define GET_BIT(lll,uuu)                          \
-   GET_BITS(lll,uuu,1)
+   GET_BITS_SMALL(lll,uuu,1)
+
+#define UNGET_BITS(nnn)                           \
+   bsLive += (nnn);
 
 /*---------------------------------------------------*/
+/* returns 0 on EOB, 256 on BZ_RUNA, 512 on BZ_RUNB, */
+/* mtf value of symbol on 1 to EOB-1,                */
 #define GET_MTF_VAL(label1,label2,lval)           \
 {                                                 \
-   if (groupPos == 0) {                           \
-      groupNo++;                                  \
-      if (groupNo >= nSelectors)                  \
-         RETURN(BZ_DATA_ERROR);                   \
-      groupPos = BZ_G_SIZE;                       \
+   if ((groupPos -= 1) < 0) {                     \
+      if (--groupNo < 0)                          \
+         RETERR(BZ_DATA_ERROR);                   \
       gSel = s->selector[groupNo];                \
-      gMinlen = s->minLens[gSel];                 \
-      gLimit = &(s->limit[gSel][0]);              \
-      gPerm = &(s->perm[gSel][0]);                \
-      gBase = &(s->base[gSel][0]);                \
+      gRec = &(s->groupRec[gSel]);                \
+      groupPos = BZ_G_SIZE - 1;                   \
    }                                              \
-   groupPos--;                                    \
-   zn = gMinlen;                                  \
-   GET_BITS(label1, zvec, zn);                    \
-   while (1) {                                    \
-      if (zn > 20 /* the longest code */)         \
-         RETURN(BZ_DATA_ERROR);                   \
-      if (zvec <= gLimit[zn]) break;              \
-      zn++;                                       \
-      GET_BIT(label2, zj);                        \
-      zvec = (zvec << 1) | zj;                    \
+   do {                                           \
+      if ((bsLive -= BZ_START_DECODE_LEN) < 0) {  \
+         while (bsPtr == bsEnd) {                 \
+            s->state = label1;                    \
+            RETURN(BZ_OK);                        \
+            case label1:                          \
+            gSel = s->selector[groupNo];          \
+            gRec = &(s->groupRec[gSel]);          \
+         }                                        \
+         bsBuff                                   \
+            = (bsBuff << 8) | (UInt32)(*bsPtr);   \
+         bsLive += 8;                             \
+         bsPtr++;                                 \
+      }                                           \
+      zvec = (bsBuff >> bsLive) &                 \
+             ((1 << BZ_START_DECODE_LEN) - 1);    \
+   } while(False);                                \
+   if ((Int32)zvec <= gRec->limit[0]) {           \
+      UNGET_BITS(gRec->len[zvec]);                \
+      lval = gRec->perm[zvec];                    \
+   } else {                                       \
+      zn = BZ_START_DECODE_LEN;                   \
+      do {                                        \
+         zn++;                                    \
+         if (--bsLive < 0) {                      \
+            while (bsPtr == bsEnd) {              \
+               s->save_zn = zn;                   \
+               s->save_zvec = zvec;               \
+               s->state = label2;                 \
+               RETURN(BZ_OK);                     \
+               case label2:                       \
+               gSel = s->selector[groupNo];       \
+               gRec = &(s->groupRec[gSel]);       \
+               zn = s->save_zn;                   \
+               zvec = s->save_zvec;               \
+            }                                     \
+            bsBuff = (UInt32)(*bsPtr);            \
+            bsLive = 7;                           \
+            bsPtr++;                              \
+            zj = (Int)bsBuff >> 7;                \
+         } else {                                 \
+            zj = ((Int)bsBuff >> bsLive) & 1;     \
+         }                                        \
+         zvec = (zvec << 1) + zj;                 \
+      } while ((Int32)zvec > gRec->limit[zn]);    \
+      lval = gRec->perm[zvec - gRec->base[zn]];   \
    };                                             \
-   if (zvec - gBase[zn] < 0                       \
-       || zvec - gBase[zn] >= BZ_MAX_ALPHA_SIZE)  \
-      RETURN(BZ_DATA_ERROR);                      \
-   lval = gPerm[zvec - gBase[zn]];                \
+}
+
+/*---------------------------------------------------*/
+/* additionally saves / restores es and N before /   */
+/* after RETURN                                      */
+#define GET_MTF_VAL_ES(label1,label2,lval)        \
+{                                                 \
+   if ((groupPos -= 1) < 0) {                     \
+      if (--groupNo < 0)                          \
+         RETERR(BZ_DATA_ERROR);                   \
+      gSel = s->selector[groupNo];                \
+      gRec = &(s->groupRec[gSel]);                \
+      groupPos = BZ_G_SIZE - 1;                   \
+   }                                              \
+   do {                                           \
+      if ((bsLive -= BZ_START_DECODE_LEN) < 0) {  \
+         while (bsPtr == bsEnd) {                 \
+            s->save_es = es;                      \
+            s->save_N = N;                        \
+            s->state = label1;                    \
+            RETURN(BZ_OK);                        \
+            case label1:                          \
+            gSel = s->selector[groupNo];          \
+            gRec = &(s->groupRec[gSel]);          \
+            es = s->save_es;                      \
+            N = s->save_N;                        \
+         }                                        \
+         bsBuff                                   \
+            = (bsBuff << 8) | (UInt32)(*bsPtr);   \
+         bsLive += 8;                             \
+         bsPtr++;                                 \
+      }                                           \
+      zvec = (bsBuff >> bsLive) &                 \
+             ((1 << BZ_START_DECODE_LEN) - 1);    \
+   } while(False);                                \
+   if ((Int32)zvec <= gRec->limit[0]) {           \
+      UNGET_BITS(gRec->len[zvec]);                \
+      lval = gRec->perm[zvec];                    \
+   } else {                                       \
+      zn = BZ_START_DECODE_LEN;                   \
+      do {                                        \
+         zn++;                                    \
+         if (--bsLive < 0) {                      \
+            while (bsPtr == bsEnd) {              \
+               s->save_es = es;                   \
+               s->save_N = N;                     \
+               s->save_zn = zn;                   \
+               s->save_zvec = zvec;               \
+               s->state = label2;                 \
+               RETURN(BZ_OK);                     \
+               case label2:                       \
+               gSel = s->selector[groupNo];       \
+               gRec = &(s->groupRec[gSel]);       \
+               es = s->save_es;                   \
+               N = s->save_N;                     \
+               zn = s->save_zn;                   \
+               zvec = s->save_zvec;               \
+            }                                     \
+            bsBuff = (UInt32)(*bsPtr);            \
+            bsLive = 7;                           \
+            bsPtr++;                              \
+            zj = (Int)bsBuff >> 7;                \
+         } else {                                 \
+            zj = ((Int)bsBuff >> bsLive) & 1;     \
+         }                                        \
+         zvec = (zvec << 1) + zj;                 \
+      } while ((Int32)zvec > gRec->limit[zn]);    \
+      lval = gRec->perm[zvec - gRec->base[zn]];   \
+   };                                             \
 }
 
 
 /*---------------------------------------------------*/
 Int32 BZ2_decompress ( DState* s )
 {
-   UChar      uc;
+   UInt32     uc;
    Int32      retVal;
-   Int32      minLen, maxLen;
-   bz_stream* strm = s->strm;
+   UChar      *bsPtr, *bsEnd;
+   UInt32     bsBuff;
+   Int32      bsLive;
+   Int        gSel;
+   Int        zj;
+   UInt       nextSym;
+   GRec*      gRec;
 
    /* stuff that needs to be saved/restored */
-   Int32  i;
-   Int32  j;
-   Int32  t;
-   Int32  alphaSize;
-   Int32  nGroups;
-   Int32  nSelectors;
-   Int32  EOB;
-   Int32  groupNo;
-   Int32  groupPos;
-   Int32  nextSym;
-   Int32  nblockMAX;
-   Int32  nblock;
-   Int32  es;
-   Int32  N;
-   Int32  curr;
-   Int32  zt;
-   Int32  zn; 
-   Int32  zvec;
-   Int32  zj;
-   Int32  gSel;
-   Int32  gMinlen;
-   Int32* gLimit;
-   Int32* gBase;
-   Int32* gPerm;
+   Int    groupNo;
+   Int    groupPos;
+   Int    nblock;
+   Int    es;
+   Int    N;
+   Int    zn; 
+   Int    zvec;
 
-   if (s->state == BZ_X_MAGIC_1) {
-      /*initialise the save area*/
-      s->save_i           = 0;
-      s->save_j           = 0;
-      s->save_t           = 0;
-      s->save_alphaSize   = 0;
-      s->save_nGroups     = 0;
-      s->save_nSelectors  = 0;
-      s->save_EOB         = 0;
-      s->save_groupNo     = 0;
-      s->save_groupPos    = 0;
-      s->save_nextSym     = 0;
-      s->save_nblockMAX   = 0;
-      s->save_nblock      = 0;
-      s->save_es          = 0;
-      s->save_N           = 0;
-      s->save_curr        = 0;
-      s->save_zt          = 0;
-      s->save_zn          = 0;
-      s->save_zvec        = 0;
-      s->save_zj          = 0;
-      s->save_gSel        = 0;
-      s->save_gMinlen     = 0;
-      s->save_gLimit      = NULL;
-      s->save_gBase       = NULL;
-      s->save_gPerm       = NULL;
+   {
+      bz_stream* strm = s->strm;
+      bsPtr = (UChar *)strm->next_in;
+      bsEnd = bsPtr + strm->avail_in;
+      bsBuff = s->save_bsBuff;
+      bsLive = s->save_bsLive;
    }
-
    /*restore from the save area*/
-   i           = s->save_i;
-   j           = s->save_j;
-   t           = s->save_t;
-   alphaSize   = s->save_alphaSize;
-   nGroups     = s->save_nGroups;
-   nSelectors  = s->save_nSelectors;
-   EOB         = s->save_EOB;
    groupNo     = s->save_groupNo;
    groupPos    = s->save_groupPos;
-   nextSym     = s->save_nextSym;
-   nblockMAX   = s->save_nblockMAX;
    nblock      = s->save_nblock;
-   es          = s->save_es;
-   N           = s->save_N;
-   curr        = s->save_curr;
-   zt          = s->save_zt;
-   zn          = s->save_zn; 
-   zvec        = s->save_zvec;
-   zj          = s->save_zj;
-   gSel        = s->save_gSel;
-   gMinlen     = s->save_gMinlen;
-   gLimit      = s->save_gLimit;
-   gBase       = s->save_gBase;
-   gPerm       = s->save_gPerm;
 
    retVal = BZ_OK;
 
    switch (s->state) {
 
+/* aliases of saved variables (nblock, groupPos, groupNo are not used
+   before decoding of MTF values) */
+#define i nblock
+#define j groupPos
+#define curr groupNo
+
+/* aliases of DState members (tPos, k0, nblock_used are not used
+   before inverse BWT */
+#define EOB (s->tPos)
+#define nGroups (s->k0)
+#define nSelectors (s->nblock_used)
+
+      case BZ_X_MAGIC_0:
+
       GET_UCHAR(BZ_X_MAGIC_1, uc);
-      if (uc != BZ_HDR_B) RETURN(BZ_DATA_ERROR_MAGIC);
-
+      if ((UChar)uc != BZ_HDR_B) RETERR(BZ_DATA_ERROR_MAGIC);
       GET_UCHAR(BZ_X_MAGIC_2, uc);
-      if (uc != BZ_HDR_Z) RETURN(BZ_DATA_ERROR_MAGIC);
+      if ((UChar)uc != BZ_HDR_Z) RETERR(BZ_DATA_ERROR_MAGIC);
+      GET_UCHAR(BZ_X_MAGIC_3, uc);
+      if ((UChar)uc != BZ_HDR_h) RETERR(BZ_DATA_ERROR_MAGIC);
 
-      GET_UCHAR(BZ_X_MAGIC_3, uc)
-      if (uc != BZ_HDR_h) RETURN(BZ_DATA_ERROR_MAGIC);
-
-      GET_BITS(BZ_X_MAGIC_4, s->blockSize100k, 8)
+      GET_UCHAR(BZ_X_MAGIC_4, s->blockSize100k)
       if (s->blockSize100k < (BZ_HDR_0 + 1) || 
-          s->blockSize100k > (BZ_HDR_0 + 9)) RETURN(BZ_DATA_ERROR_MAGIC);
+          s->blockSize100k > (BZ_HDR_0 + 9)) RETERR(BZ_DATA_ERROR_MAGIC);
       s->blockSize100k -= BZ_HDR_0;
 
       if (s->smallDecompress) {
+         bz_stream* strm = s->strm;
          s->ll16 = BZALLOC( s->blockSize100k * 100000 * sizeof(UInt16) );
          s->ll4  = BZALLOC( 
                       ((1 + s->blockSize100k * 100000) >> 1) * sizeof(UChar) 
                    );
-         if (s->ll16 == NULL || s->ll4 == NULL) RETURN(BZ_MEM_ERROR);
+         if (s->ll16 == NULL || s->ll4 == NULL) RETERR(BZ_MEM_ERROR);
       } else {
+         bz_stream* strm = s->strm;
          s->tt  = BZALLOC( s->blockSize100k * 100000 * sizeof(Int32) );
-         if (s->tt == NULL) RETURN(BZ_MEM_ERROR);
+         if (s->tt == NULL) RETERR(BZ_MEM_ERROR);
       }
 
-      GET_UCHAR(BZ_X_BLKHDR_1, uc);
+      case BZ_X_BLKHDR_0:
+      GET_BITS_SMALL(BZ_X_BLKHDR_1, uc, 8)
 
       if (uc == 0x17) goto endhdr_2;
-      if (uc != 0x31) RETURN(BZ_DATA_ERROR);
+      if (uc != 0x31) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_BLKHDR_2, uc);
-      if (uc != 0x41) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x41) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_BLKHDR_3, uc);
-      if (uc != 0x59) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x59) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_BLKHDR_4, uc);
-      if (uc != 0x26) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x26) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_BLKHDR_5, uc);
-      if (uc != 0x53) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x53) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_BLKHDR_6, uc);
-      if (uc != 0x59) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x59) RETERR(BZ_DATA_ERROR);
 
       s->currBlockNo++;
       if (s->verbosity >= 2)
@@ -248,7 +335,7 @@ Int32 BZ2_decompress ( DState* s )
       GET_UCHAR(BZ_X_BCRC_4, uc);
       s->storedBlockCRC = (s->storedBlockCRC << 8) | ((UInt32)uc);
 
-      GET_BITS(BZ_X_RANDBIT, s->blockRandomised, 1);
+      GET_BIT(BZ_X_RANDBIT, s->blockRandomised);
 
       s->origPtr = 0;
       GET_UCHAR(BZ_X_ORIGPTR_1, uc);
@@ -259,338 +346,465 @@ Int32 BZ2_decompress ( DState* s )
       s->origPtr = (s->origPtr << 8) | ((Int32)uc);
 
       if (s->origPtr < 0)
-         RETURN(BZ_DATA_ERROR);
-      if (s->origPtr > 10 + 100000*s->blockSize100k) 
-         RETURN(BZ_DATA_ERROR);
+         RETERR(BZ_DATA_ERROR);
+      if (s->origPtr > 100000*s->blockSize100k) 
+         RETERR(BZ_DATA_ERROR);
 
       /*--- Receive the mapping table ---*/
       for (i = 0; i < 16; i++) {
          GET_BIT(BZ_X_MAPPING_1, uc);
          if (uc == 1) 
-            s->inUse16[i] = True; else 
-            s->inUse16[i] = False;
+            s->mtfa[i + 256] = True; else 
+            s->mtfa[i + 256] = False;
       }
 
-      for (i = 0; i < 256; i++) s->inUse[i] = False;
-
-      for (i = 0; i < 16; i++)
-         if (s->inUse16[i])
-            for (j = 0; j < 16; j++) {
+      curr = 0;
+      for (j = 0; j < 16; j++)
+         if (s->mtfa[j + 256])
+            for (i = 0; i < 16; i++) {
                GET_BIT(BZ_X_MAPPING_2, uc);
-               if (uc == 1) s->inUse[i * 16 + j] = True;
+               if (uc == 1) {
+                  s->mtfa[curr] = j * 16 + i;
+                  curr++;
+               }
             }
-      makeMaps_d ( s );
-      if (s->nInUse == 0) RETURN(BZ_DATA_ERROR);
-      alphaSize = s->nInUse+2;
+
+      if (curr == 0) RETERR(BZ_DATA_ERROR);
+      EOB = curr + 1;
 
       /*--- Now the selectors ---*/
-      GET_BITS(BZ_X_SELECTOR_1, nGroups, 3);
-      if (nGroups < 2 || nGroups > 6) RETURN(BZ_DATA_ERROR);
-      GET_BITS(BZ_X_SELECTOR_2, nSelectors, 15);
-      if (nSelectors < 1) RETURN(BZ_DATA_ERROR);
-      for (i = 0; i < nSelectors; i++) {
-         j = 0;
+      GET_BITS(BZ_X_SELECTOR_1, uc, 18);
+      nGroups = (uc >> 15) - 1;
+      nSelectors = uc & ((1 << 15) - 1); 
+      if (nGroups < 1 || nGroups > 5) RETERR(BZ_DATA_ERROR);
+      if (nSelectors < 1  || nSelectors > BZ_MAX_SELECTORS) RETERR(BZ_DATA_ERROR);
+      for (i = nSelectors - 1, j = nGroups, curr = 0; i >= 0; i--) {
          while (True) {
-            GET_BIT(BZ_X_SELECTOR_3, uc);
+            GET_BIT(BZ_X_SELECTOR_2, uc);
             if (uc == 0) break;
-            j++;
-            if (j >= nGroups) RETURN(BZ_DATA_ERROR);
+            if (curr >= j) RETERR(BZ_DATA_ERROR);
+            curr++;
          }
-         s->selectorMtf[i] = j;
+         s->selector[i] = curr;
+         curr = 0;
       }
 
       /*--- Undo the MTF values for the selectors. ---*/
       {
-         UChar pos[BZ_N_GROUPS], tmp, v;
-         for (v = 0; v < nGroups; v++) pos[v] = v;
+         UChar pos[BZ_N_GROUPS], tmp;
+         UInt v;
+         Int  i;
+         for (v = 0; (Int32)v <= nGroups; v++) pos[v] = v;
    
-         for (i = 0; i < nSelectors; i++) {
-            v = s->selectorMtf[i];
-            tmp = pos[v];
-            while (v > 0) { pos[v] = pos[v-1]; v--; }
-            pos[0] = tmp;
+         for (i = nSelectors - 1, tmp = 0; i >= 0; i--) {
+            v = s->selector[i];
+            if (v > 0) {
+               tmp = pos[v];
+               do { v--; pos[v + 1] = pos[v]; } while (v > 0);
+               pos[0] = tmp;
+            }
             s->selector[i] = tmp;
          }
       }
 
       /*--- Now the coding tables ---*/
-      for (t = 0; t < nGroups; t++) {
-         GET_BITS(BZ_X_CODING_1, curr, 5);
-         for (i = 0; i < alphaSize; i++) {
+      for (j = 0; (Int32)j <= nGroups; j++) {
+         GET_BITS_SMALL(BZ_X_CODING_1, curr, 5);
+         for (i = 0; (UInt32)i <= EOB; i++) {
             while (True) {
-               if (curr < 1 || curr > 20) RETURN(BZ_DATA_ERROR);
-               GET_BIT(BZ_X_CODING_2, uc);
-               if (uc == 0) break;
-               GET_BIT(BZ_X_CODING_3, uc);
-               if (uc == 0) curr++; else curr--;
+               if (curr < 1 || curr > BZ_MAX_DECODE_LEN) RETERR(BZ_DATA_ERROR);
+               GET_BITS_SMALL(BZ_X_CODING_2, uc, 2);
+               if ((uc & 2) == 0) break;
+               if ((uc & 1) == 0) curr++; else curr--;
             }
-            s->len[t][i] = curr;
+            UNGET_BITS(1);
+            s->groupRec[j].len[i] = curr;
          }
       }
 
       /*--- Create the Huffman decoding tables ---*/
-      for (t = 0; t < nGroups; t++) {
-         minLen = 32;
-         maxLen = 0;
-         for (i = 0; i < alphaSize; i++) {
-            if (s->len[t][i] > maxLen) maxLen = s->len[t][i];
-            if (s->len[t][i] < minLen) minLen = s->len[t][i];
+      {
+         Int   i;
+         Int32 startLen;
+
+         for (i = 0; (Int32)i <= nGroups; i++) {
+            startLen = BZ2_hbCreateDecodeTables ( 
+               &(s->groupRec[i].limit[0]), 
+               &(s->groupRec[i].base[0]), 
+               &(s->groupRec[i].perm[0]), 
+               &(s->groupRec[i].len[0]),
+               EOB
+             );
+             if (startLen < 0) RETERR(BZ_DATA_ERROR);
          }
-         BZ2_hbCreateDecodeTables ( 
-            &(s->limit[t][0]), 
-            &(s->base[t][0]), 
-            &(s->perm[t][0]), 
-            &(s->len[t][0]),
-            minLen, maxLen, alphaSize
-         );
-         s->minLens[t] = minLen;
       }
 
       /*--- Now the MTF values ---*/
 
-      EOB      = s->nInUse+1;
-      nblockMAX = 100000 * s->blockSize100k;
-      groupNo  = -1;
+      groupNo  = nSelectors;
       groupPos = 0;
-
-      for (i = 0; i <= 255; i++) s->unzftab[i] = 0;
-
-      /*-- MTF init --*/
-      {
-         Int32 ii, jj, kk;
-         kk = MTFA_SIZE-1;
-         for (ii = 256 / MTFL_SIZE - 1; ii >= 0; ii--) {
-            for (jj = MTFL_SIZE-1; jj >= 0; jj--) {
-               s->mtfa[kk] = (UChar)(ii * MTFL_SIZE + jj);
-               kk--;
-            }
-            s->mtfbase[ii] = kk + 1;
-         }
+      nblock = 100000 * s->blockSize100k;
+      if (s->smallDecompress) {
+         s->eblock = s->ll16 + nblock;
+      } else {
+         s->eblock = s->tt + nblock;
       }
-      /*-- end MTF init --*/
+      nblock = -nblock;
+      gRec = NULL;
 
-      nblock = 0;
-      GET_MTF_VAL(BZ_X_MTF_1, BZ_X_MTF_2, nextSym);
+#undef i
+#undef j
+#undef curr
+
+      {
+         Int i;
+
+         for (i = 0; i < 256; i++) s->cftab[i] = 0;
+   
+         /*-- MTF init --*/
+         {
+            UChar *p;
+            for (i = EOB - 1, p = &(s->mtfa[MTFA_SIZE]); i != 0; ) *--p = s->mtfa[--i];
+            for (i = 0; p < &(s->mtfa[MTFA_SIZE]); i++) {
+               s->mtfbase[i] = p;
+               p += MTFL_SIZE;
+            }
+         }
+         /*-- end MTF init --*/
+      }
 
       while (True) {
+         UInt uc;
 
-         if (nextSym == EOB) break;
+         GET_MTF_VAL(BZ_X_MTF_1, BZ_X_MTF_2, nextSym);
 
-         if (nextSym == BZ_RUNA || nextSym == BZ_RUNB) {
+         if (nextSym >= 256) {
 
-            es = -1;
+            es = nextSym;
             N = 1;
-            do {
-               /* Check that N doesn't get too big, so that es doesn't
-                  go negative.  The maximum value that can be
+            while (True) {
+               GET_MTF_VAL_ES(BZ_X_MTF_3, BZ_X_MTF_4, nextSym);
+               if (nextSym < 256) break;
+               /* Check that es doesn't get too big, so that it doesn't
+                  go negative. The maximum value that can be
                   RUNA/RUNB encoded is equal to the block size (post
-                  the initial RLE), viz, 900k, so bounding N at 2
-                  million should guard against overflow without
+                  the initial RLE), viz, 900k, so bounding es at 1M
+                  should guard against overflow without
                   rejecting any legitimate inputs. */
-               if (N >= 2*1024*1024) RETURN(BZ_DATA_ERROR);
-               if (nextSym == BZ_RUNA) es = es + (0+1) * N; else
-               if (nextSym == BZ_RUNB) es = es + (1+1) * N;
-               N = N * 2;
-               GET_MTF_VAL(BZ_X_MTF_3, BZ_X_MTF_4, nextSym);
+               if (es > 1024*1024*256) RETERR(BZ_DATA_ERROR);
+               es += nextSym << N;
+               N++;
             }
-               while (nextSym == BZ_RUNA || nextSym == BZ_RUNB);
 
-            es++;
-            uc = s->seqToUnseq[ s->mtfa[s->mtfbase[0]] ];
-            s->unzftab[uc] += es;
-
-            if (s->smallDecompress)
-               while (es > 0) {
-                  if (nblock >= nblockMAX) RETURN(BZ_DATA_ERROR);
-                  s->ll16[nblock] = (UInt16)uc;
+            uc = *(s->mtfbase[0]);
+            es >>= 8;
+            s->cftab[uc] += es;
+            if ((es += nblock) > 0) RETERR(BZ_DATA_ERROR);
+             
+            if (s->smallDecompress) {
+               UInt16 *p = s->eblock;
+               do {
+                  p[nblock] = (UInt16)uc;
                   nblock++;
-                  es--;
-               }
-            else
-               while (es > 0) {
-                  if (nblock >= nblockMAX) RETURN(BZ_DATA_ERROR);
-                  s->tt[nblock] = (UInt32)uc;
+               } while (nblock < es);
+            } else {
+               UInt32 *p = s->eblock;
+               do {
+                  p[nblock] = (UInt32)uc;
                   nblock++;
-                  es--;
-               };
+               } while (nblock < es);
+            }
+         }
 
-            continue;
+         {
 
-         } else {
+            if (nblock == 0) {
+               if (nextSym == 0) goto EndOfBlock;
+               RETERR(BZ_DATA_ERROR);
+            }
 
-            if (nblock >= nblockMAX) RETURN(BZ_DATA_ERROR);
-
-            /*-- uc = MTF ( nextSym-1 ) --*/
+            /*-- uc = MTF ( nextSym ) --*/
             {
-               Int32 ii, jj, kk, pp, lno, off;
-               UInt32 nn;
-               nn = (UInt32)(nextSym - 1);
+               UChar *pp, *p0;
+               UInt  lno, off;
 
-               if (nn < MTFL_SIZE) {
+               if (nextSym < MTFL_SIZE) {
                   /* avoid general-case expense */
-                  pp = s->mtfbase[0];
-                  uc = s->mtfa[pp+nn];
-                  while (nn > 3) {
-                     Int32 z = pp+nn;
-                     s->mtfa[(z)  ] = s->mtfa[(z)-1];
-                     s->mtfa[(z)-1] = s->mtfa[(z)-2];
-                     s->mtfa[(z)-2] = s->mtfa[(z)-3];
-                     s->mtfa[(z)-3] = s->mtfa[(z)-4];
-                     nn -= 4;
+                  p0 = s->mtfbase[0];
+                  uc = p0[nextSym];
+                  switch (nextSym) {
+                     case 0:  goto EndOfBlock;
+                     case 15: p0[15] = p0[14];
+                     case 14: p0[14] = p0[13];
+                     case 13: p0[13] = p0[12];
+                     case 12: p0[12] = p0[11];
+                     case 11: p0[11] = p0[10];
+                     case 10: p0[10] = p0[9];
+                     case 9:  p0[9]  = p0[8];
+                     case 8:  p0[8]  = p0[7];
+                     case 7:  p0[7]  = p0[6];
+                     case 6:  p0[6]  = p0[5];
+                     case 5:  p0[5]  = p0[4];
+                     case 4:  p0[4]  = p0[3];
+                     case 3:  p0[3]  = p0[2];
+                     case 2:  p0[2]  = p0[1];
+                     case 1:  p0[1]  = p0[0];
                   }
-                  while (nn > 0) { 
-                     s->mtfa[(pp+nn)] = s->mtfa[(pp+nn)-1]; nn--; 
-                  };
-                  s->mtfa[pp] = uc;
+                  *p0 = uc;
                } else { 
                   /* general case */
-                  lno = nn / MTFL_SIZE;
-                  off = nn % MTFL_SIZE;
-                  pp = s->mtfbase[lno] + off;
-                  uc = s->mtfa[pp];
-                  while (pp > s->mtfbase[lno]) { 
-                     s->mtfa[pp] = s->mtfa[pp-1]; pp--; 
-                  };
-                  s->mtfbase[lno]++;
-                  while (lno > 0) {
-                     s->mtfbase[lno]--;
-                     s->mtfa[s->mtfbase[lno]] 
-                        = s->mtfa[s->mtfbase[lno-1] + MTFL_SIZE - 1];
-                     lno--;
+                  lno = nextSym / MTFL_SIZE;
+                  off = nextSym % MTFL_SIZE;
+                  p0 = s->mtfbase[lno];
+                  pp = s->mtfbase[0];
+                  pp[-1] = p0[off];
+                  pp = s->mtfbase[lno - 1];
+                  switch (off) {
+                     case 15: p0[15] = p0[14];
+                     case 14: p0[14] = p0[13];
+                     case 13: p0[13] = p0[12];
+                     case 12: p0[12] = p0[11];
+                     case 11: p0[11] = p0[10];
+                     case 10: p0[10] = p0[9];
+                     case 9:  p0[9]  = p0[8];
+                     case 8:  p0[8]  = p0[7];
+                     case 7:  p0[7]  = p0[6];
+                     case 6:  p0[6]  = p0[5];
+                     case 5:  p0[5]  = p0[4];
+                     case 4:  p0[4]  = p0[3];
+                     case 3:  p0[3]  = p0[2];
+                     case 2:  p0[2]  = p0[1];
+                     case 1:  p0[1]  = p0[0];
                   }
-                  s->mtfbase[0]--;
-                  s->mtfa[s->mtfbase[0]] = uc;
-                  if (s->mtfbase[0] == 0) {
-                     kk = MTFA_SIZE-1;
-                     for (ii = 256 / MTFL_SIZE-1; ii >= 0; ii--) {
-                        for (jj = MTFL_SIZE-1; jj >= 0; jj--) {
-                           s->mtfa[kk] = s->mtfa[s->mtfbase[ii] + jj];
-                           kk--;
-                        }
-                        s->mtfbase[ii] = kk + 1;
+                  switch (lno) {
+                     case 15: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[13];
+                              s->mtfbase[14] = p0;
+                     case 14: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[12];
+                              s->mtfbase[13] = p0;
+                     case 13: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[11];
+                              s->mtfbase[12] = p0;
+                     case 12: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[10];
+                              s->mtfbase[11] = p0;
+                     case 11: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[9];
+                              s->mtfbase[10] = p0;
+                     case 10: *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[8];
+                              s->mtfbase[9] = p0;
+                     case 9:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[7];
+                              s->mtfbase[8] = p0;
+                     case 8:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[6];
+                              s->mtfbase[7] = p0;
+                     case 7:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[5];
+                              s->mtfbase[6] = p0;
+                     case 6:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[4];
+                              s->mtfbase[5] = p0;
+                     case 5:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[3];
+                              s->mtfbase[4] = p0;
+                     case 4:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[2];
+                              s->mtfbase[3] = p0;
+                     case 3:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[1];
+                              s->mtfbase[2] = p0;
+                     case 2:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              pp = s->mtfbase[0];
+                              s->mtfbase[1] = p0;
+                     case 0:  /*--not reached--*/
+                     case 1:  *p0 = pp[MTFL_SIZE - 1];
+                              p0 = pp - 1;
+                              s->mtfbase[0] = p0;
+                  }
+                  uc = *p0;
+                  if (p0 == s->mtfa) {
+                     lno = (EOB - 2) / MTFL_SIZE;
+                     p0 = s->mtfbase[lno];
+                     while (lno != 0) {
+                        lno--;
+                        pp = s->mtfbase[lno] + MTFL_SIZE;
+                        do {
+                           *--p0 = *--pp;
+                        } while (pp > s->mtfbase[lno]);
+                        s->mtfbase[lno] = p0;
                      }
                   }
                }
             }
-            /*-- end uc = MTF ( nextSym-1 ) --*/
+            /*-- end uc = MTF ( nextSym ) --*/
 
-            s->unzftab[s->seqToUnseq[uc]]++;
+            s->cftab[uc]++;
             if (s->smallDecompress)
-               s->ll16[nblock] = (UInt16)(s->seqToUnseq[uc]); else
-               s->tt[nblock]   = (UInt32)(s->seqToUnseq[uc]);
+               ((UInt16*)(s->eblock))[nblock] = (UInt16)(uc); else
+               ((UInt32*)(s->eblock))[nblock] = (UInt32)(uc);
             nblock++;
-
-            GET_MTF_VAL(BZ_X_MTF_5, BZ_X_MTF_6, nextSym);
-            continue;
          }
       }
 
+#undef EOB
+#undef nGroups
+#undef nSelectors
+
+      EndOfBlock:
+      nblock += 100000 * s->blockSize100k;
       /* Now we know what nblock is, we can do a better sanity
          check on s->origPtr.
       */
       if (s->origPtr < 0 || s->origPtr >= nblock)
-         RETURN(BZ_DATA_ERROR);
+         RETERR(BZ_DATA_ERROR);
 
-      /*-- Set up cftab to facilitate generation of T^(-1) --*/
-      /* Check: unzftab entries in range. */
-      for (i = 0; i <= 255; i++) {
-         if (s->unzftab[i] < 0 || s->unzftab[i] > nblock)
-            RETURN(BZ_DATA_ERROR);
-      }
-      /* Actually generate cftab. */
-      s->cftab[0] = 0;
-      for (i = 1; i <= 256; i++) s->cftab[i] = s->unzftab[i-1];
-      for (i = 1; i <= 256; i++) s->cftab[i] += s->cftab[i-1];
-      /* Check: cftab entries in range. */
-      for (i = 0; i <= 256; i++) {
-         if (s->cftab[i] < 0 || s->cftab[i] > nblock) {
-            /* s->cftab[i] can legitimately be == nblock */
-            RETURN(BZ_DATA_ERROR);
-         }
-      }
-      /* Check: cftab entries non-descending. */
-      for (i = 1; i <= 256; i++) {
-         if (s->cftab[i-1] > s->cftab[i]) {
-            RETURN(BZ_DATA_ERROR);
-         }
+      s->save_bsBuff = bsBuff;
+      s->save_bsLive = bsLive;
+      {
+         bz_stream* strm = s->strm;
+         UInt32     processed = bsPtr - (UChar *)strm->next_in;
+         UInt32     new_total_in_lo32;
+   
+         strm->next_in = (char *)bsPtr;
+         new_total_in_lo32 = strm->total_in_lo32 + processed;
+         if(new_total_in_lo32 < strm->total_in_lo32) strm->total_in_hi32++;
+         strm->total_in_lo32 = new_total_in_lo32;
+         strm->avail_in -= processed;
       }
 
+      /* let block = (s->smallDecompress ? s->ll16 : s->tt),
+         let c[v] = cftab[v]
+         now block[i] >= 0 and block[i] < 256 for each i >= 0 and i < nblock,
+         cftab[v] is count of value v in block
+         thus cftab[v] >= 0 for each v >= 0 and v < 256
+         and sum(cftab[v]) for v from 0 to 255 is equal to nblock
+      */
+      s->nblock_used = nblock;
       s->state_out_len = 0;
       s->state_out_ch  = 0;
       BZ_INITIALISE_CRC ( s->calculatedBlockCRC );
       s->state = BZ_X_OUTPUT;
       if (s->verbosity >= 2) VPrintf0 ( "rt+rld" );
 
-      if (s->smallDecompress) {
+      {
+         Int32 i, j;
 
-         /*-- Make a copy of cftab, used in generation of T --*/
-         for (i = 0; i <= 256; i++) s->cftabCopy[i] = s->cftab[i];
+         /* Actually generate cftab. */
+         for (i = 1; i < 256; i++) s->cftab[i] += s->cftab[i-1];
+         /* now cftab[0] == c[0], cftab[1] == c[0] + c[1], ...,
+            cftab[255] == c[0] + c[1] + ... + c[255]
+         */ 
 
-         /*-- compute the T vector --*/
-         for (i = 0; i < nblock; i++) {
-            uc = (UChar)(s->ll16[i]);
-            SET_LL(i, s->cftabCopy[uc]);
-            s->cftabCopy[uc]++;
-         }
+         if (s->smallDecompress) {
+            UInt16* c_ll16 = s->ll16;
+            UChar*  c_ll4 = s->ll4;
+   
+            /*-- compute the T vector --*/
+            i = nblock - 1;
+            if ((i & 1) == 0) {
+               uc = (UChar)(c_ll16[i]);
+               s->cftab[uc]--;
+               c_ll16[i] = (UInt16)(s->cftab[uc] & 0x0000ffff);
+               c_ll4[(i) >> 1] = (s->cftab[uc] >> 16);
+               i--;
+            }
+            while (i >= 0) {
+               uc = (UChar)(c_ll16[i]);
+               s->cftab[uc]--;
+               c_ll16[i] = (UInt16)(s->cftab[uc] & 0x0000ffff);
+               j = (s->cftab[uc] >> 16) << 4;
+               i--;
+               uc = (UChar)(c_ll16[i]);
+               s->cftab[uc]--;
+               c_ll16[i] = (UInt16)(s->cftab[uc] & 0x0000ffff);
+               c_ll4[(i) >> 1] = (s->cftab[uc] >> 16) | j;
+               i--;
+            }
+            /* now cftab[0] == 0, cftab[1] == c[0],
+               cftab[2] = c[0] + c[1], ...,
+               cftab[255] == c[0] + c[1] + ... + c[254];
+               
+            */ 
+   
+            /*-- Compute T^(-1) by pointer reversal on T --*/
+            i = s->origPtr;
+            j = GET_LL_C(i);
+            do {
+               Int32 tmp = GET_LL_C(j);
+               SET_LL_C(j, i);
+               i = j;
+               j = tmp;
+            } while (i != s->origPtr);
 
-         /*-- Compute T^(-1) by pointer reversal on T --*/
-         i = s->origPtr;
-         j = GET_LL(i);
-         do {
-            Int32 tmp = GET_LL(j);
-            SET_LL(j, i);
-            i = j;
-            j = tmp;
-         }
-            while (i != s->origPtr);
+            BZ2_indexCreateTab(&(s->cftab[0]), &(s->selector[0]), nblock);
 
-         s->tPos = s->origPtr;
-         s->nblock_used = 0;
-         if (s->blockRandomised) {
-            BZ_RAND_INIT_MASK;
-            BZ_GET_SMALL(s->k0); s->nblock_used++;
-            BZ_RAND_UPD_MASK; s->k0 ^= BZ_RAND_MASK; 
+            s->tPos = s->origPtr;
+            if (s->blockRandomised) {
+               BZ_RAND_INIT_MASK;
+               BZ_GET_SMALL(s->k0);
+               BZ_RAND_UPD_MASK; s->k0 ^= BZ_RAND_MASK; 
+            } else {
+               BZ_GET_SMALL(s->k0);
+            }
+   
          } else {
-            BZ_GET_SMALL(s->k0); s->nblock_used++;
+            UInt32* c_tt = s->tt;
+   
+            /*-- compute the T^(-1) vector --*/
+            for (i = nblock - 1; i >= 0; i--) {
+               uc = (UChar)(c_tt[i] & 0xff);
+               s->cftab[uc]--;
+               c_tt[s->cftab[uc]] |= (i << 8);
+            }
+            /* now (s->tt[i] >> 8) >= 0 and (s->tt[i] >> 8) < nblock
+               for each i >= 0 and i < nblock
+               and each value (s->tt[i] >> 8) is unique and assigned once
+            */
+   
+            s->tPos = c_tt[c_tt[s->origPtr] >> 8];
+            if (s->blockRandomised) {
+               BZ_RAND_INIT_MASK;
+               BZ_GET_FAST(s->k0);
+               BZ_RAND_UPD_MASK; s->k0 ^= BZ_RAND_MASK; 
+            } else {
+               BZ_GET_FAST(s->k0);
+            }
+   
          }
-
-      } else {
-
-         /*-- compute the T^(-1) vector --*/
-         for (i = 0; i < nblock; i++) {
-            uc = (UChar)(s->tt[i] & 0xff);
-            s->tt[s->cftab[uc]] |= (i << 8);
-            s->cftab[uc]++;
-         }
-
-         s->tPos = s->tt[s->origPtr] >> 8;
-         s->nblock_used = 0;
-         if (s->blockRandomised) {
-            BZ_RAND_INIT_MASK;
-            BZ_GET_FAST(s->k0); s->nblock_used++;
-            BZ_RAND_UPD_MASK; s->k0 ^= BZ_RAND_MASK; 
-         } else {
-            BZ_GET_FAST(s->k0); s->nblock_used++;
-         }
-
       }
 
-      RETURN(BZ_OK);
-
+      return(BZ_OK);
 
 
     endhdr_2:
 
       GET_UCHAR(BZ_X_ENDHDR_2, uc);
-      if (uc != 0x72) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x72) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_ENDHDR_3, uc);
-      if (uc != 0x45) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x45) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_ENDHDR_4, uc);
-      if (uc != 0x38) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x38) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_ENDHDR_5, uc);
-      if (uc != 0x50) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x50) RETERR(BZ_DATA_ERROR);
       GET_UCHAR(BZ_X_ENDHDR_6, uc);
-      if (uc != 0x90) RETURN(BZ_DATA_ERROR);
+      if ((UChar)uc != 0x90) RETERR(BZ_DATA_ERROR);
 
       s->storedCombinedCRC = 0;
       GET_UCHAR(BZ_X_CCRC_1, uc);
@@ -602,8 +816,26 @@ Int32 BZ2_decompress ( DState* s )
       GET_UCHAR(BZ_X_CCRC_4, uc);
       s->storedCombinedCRC = (s->storedCombinedCRC << 8) | ((UInt32)uc);
 
+//      RETERR(BZ_STREAM_END);
+      retVal = BZ_STREAM_END;
+      error_return:
       s->state = BZ_X_IDLE;
-      RETURN(BZ_STREAM_END);
+   
+      s->save_bsBuff = bsBuff;
+      s->save_bsLive = bsLive;
+      {
+         bz_stream* strm = s->strm;
+         UInt32     processed = bsPtr - (UChar *)strm->next_in;
+         UInt32     new_total_in_lo32;
+   
+         strm->next_in = (char *)bsPtr;
+         new_total_in_lo32 = strm->total_in_lo32 + processed;
+         if(new_total_in_lo32 < strm->total_in_lo32) strm->total_in_hi32++;
+         strm->total_in_lo32 = new_total_in_lo32;
+         strm->avail_in -= processed;
+      }
+   
+      return retVal;   
 
       default: AssertH ( False, 4001 );
    }
@@ -612,32 +844,25 @@ Int32 BZ2_decompress ( DState* s )
 
    save_state_and_return:
 
-   s->save_i           = i;
-   s->save_j           = j;
-   s->save_t           = t;
-   s->save_alphaSize   = alphaSize;
-   s->save_nGroups     = nGroups;
-   s->save_nSelectors  = nSelectors;
-   s->save_EOB         = EOB;
    s->save_groupNo     = groupNo;
    s->save_groupPos    = groupPos;
-   s->save_nextSym     = nextSym;
-   s->save_nblockMAX   = nblockMAX;
    s->save_nblock      = nblock;
-   s->save_es          = es;
-   s->save_N           = N;
-   s->save_curr        = curr;
-   s->save_zt          = zt;
-   s->save_zn          = zn;
-   s->save_zvec        = zvec;
-   s->save_zj          = zj;
-   s->save_gSel        = gSel;
-   s->save_gMinlen     = gMinlen;
-   s->save_gLimit      = gLimit;
-   s->save_gBase       = gBase;
-   s->save_gPerm       = gPerm;
 
-   return retVal;   
+   s->save_bsBuff = bsBuff;
+   s->save_bsLive = bsLive;
+   {
+      bz_stream* strm = s->strm;
+      UInt32     processed = bsPtr - (UChar *)strm->next_in;
+      UInt32     new_total_in_lo32;
+
+      strm->next_in = (char *)bsPtr;
+      new_total_in_lo32 = strm->total_in_lo32 + processed;
+      if(new_total_in_lo32 < strm->total_in_lo32) strm->total_in_hi32++;
+      strm->total_in_lo32 = new_total_in_lo32;
+      strm->avail_in -= processed;
+   }
+
+   return BZ_OK;
 }
 
 

@@ -60,7 +60,7 @@
 
 
 /*---------------------------------------------------*/
-void BZ2_hbMakeCodeLengths ( UChar *len, 
+void BZ2_hbMakeCodeLengths ( Int32 *len, 
                              Int32 *freq,
                              Int32 alphaSize,
                              Int32 maxLen )
@@ -150,7 +150,7 @@ void BZ2_hbMakeCodeLengths ( UChar *len,
 
 /*---------------------------------------------------*/
 void BZ2_hbAssignCodes ( Int32 *code,
-                         UChar *length,
+                         Int32 *length,
                          Int32 minLen,
                          Int32 maxLen,
                          Int32 alphaSize )
@@ -167,36 +167,72 @@ void BZ2_hbAssignCodes ( Int32 *code,
 
 
 /*---------------------------------------------------*/
-void BZ2_hbCreateDecodeTables ( Int32 *limit,
-                                Int32 *base,
-                                Int32 *perm,
-                                UChar *length,
-                                Int32 minLen,
-                                Int32 maxLen,
-                                Int32 alphaSize )
-{
-   Int32 pp, i, j, vec;
+#define SET_PERM(idx,val) \
+   if (length[idx] < BZ_START_DECODE_LEN) { \
+      for (j = base[length[idx]] - 1, v = base[length[idx]] - ((1 << BZ_START_DECODE_LEN) >> length[idx]); j >= v; j--) { \
+         perm[j] = (val); \
+      } \
+      base[length[idx]] = v; \
+   } else { \
+      perm[--base[length[idx]]] = (val); \
+   } \
 
-   pp = 0;
-   for (i = minLen; i <= maxLen; i++)
-      for (j = 0; j < alphaSize; j++)
-         if (length[j] == i) { perm[pp] = j; pp++; };
+Int32 BZ2_hbCreateDecodeTables ( Int32 *limit,
+                                 Int32 *base,
+                                 Int16 *perm,
+                                 UChar *length,
+                                 Int32 EOB )
+{
+   Int32 i, j, v;
+   Int32 minLen;
+   Int32 maxLen;
 
    for (i = 0; i < BZ_MAX_CODE_LEN; i++) base[i] = 0;
-   for (i = 0; i < alphaSize; i++) base[length[i]+1]++;
 
-   for (i = 1; i < BZ_MAX_CODE_LEN; i++) base[i] += base[i-1];
-
-   for (i = 0; i < BZ_MAX_CODE_LEN; i++) limit[i] = 0;
-   vec = 0;
-
-   for (i = minLen; i <= maxLen; i++) {
-      vec += (base[i+1] - base[i]);
-      limit[i] = vec-1;
-      vec <<= 1;
+   minLen = BZ_MAX_CODE_LEN; maxLen = 0;
+   for (i = EOB; i >= 0; i--) {
+      if (length[i] < minLen) minLen = length[i];
+      if (length[i] > maxLen) maxLen = length[i];
+      base[length[i]]++;
    }
-   for (i = minLen + 1; i <= maxLen; i++)
-      base[i] = ((limit[i-1] + 1) << 1) - base[i];
+
+   v = 0;
+   for (i = 1; i < BZ_START_DECODE_LEN; i++) {
+      v += base[i] << (BZ_START_DECODE_LEN - i);
+      base[i] = v;
+   }
+   for (i = BZ_START_DECODE_LEN; i < BZ_MAX_CODE_LEN; i++) {
+      v += base[i];
+      base[i] = v;
+   }
+
+   if (base[BZ_START_DECODE_LEN] > (1 << BZ_START_DECODE_LEN) ||
+       (base[BZ_START_DECODE_LEN] < (1 << BZ_START_DECODE_LEN) && maxLen <= BZ_START_DECODE_LEN)) return -1;
+
+   SET_PERM(EOB, 0);
+   for (i = EOB - 1; i > BZ_RUNB ; i--) {
+      SET_PERM(i, i - 1);
+   }
+   SET_PERM(BZ_RUNB, 2 << 8);
+   SET_PERM(BZ_RUNA, 1 << 8);
+
+   for (i = minLen, j = 0; i <= BZ_START_DECODE_LEN; i++) {
+      for (v = base[i + 1]; j < v; j++) length[j] = BZ_START_DECODE_LEN - i;
+   }
+
+   v = base[BZ_START_DECODE_LEN + 1];
+   limit[0] = v - 1;
+   if (maxLen > BZ_START_DECODE_LEN) {
+      for (i = BZ_START_DECODE_LEN + 1; i <= maxLen; i++) {
+         v = (v << 1) - base[i];
+         base[i] = v;
+         v += base[i + 1];
+         limit[i] = v - 1;
+      }
+      if (v != (1 << maxLen)) return -1;
+   }
+
+   return BZ_START_DECODE_LEN;
 }
 
 
